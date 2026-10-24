@@ -4,15 +4,29 @@ import fs from "fs";
 import categoryModel from '../models/categoryModel.js'
 import braintree from "braintree";
 import orderModel from "../models/orderModel.js";
+import mongoose from "mongoose";
 
-//payment gateway
-var gateway = new braintree.BraintreeGateway({
-  environment: braintree.Environment.Sandbox,
-  merchantId: "xrr6kxs7jjdnktz7",
-  publicKey: 'c68jnb26dcbkrvv2',
-  privateKey: "10ecc12a7d80363a9410053281e9c53d",
-});
- 
+const getBraintreeGateway = () => {
+  const { BRAINTREE_MERCHANT_ID, BRAINTREE_PUBLIC_KEY, BRAINTREE_PRIVATE_KEY } =
+    process.env;
+
+  if (
+    !BRAINTREE_MERCHANT_ID ||
+    !BRAINTREE_PUBLIC_KEY ||
+    !BRAINTREE_PRIVATE_KEY
+  ) {
+    throw new Error(
+      "Braintree credentials are not configured. Set BRAINTREE_MERCHANT_ID, BRAINTREE_PUBLIC_KEY, and BRAINTREE_PRIVATE_KEY."
+    );
+  }
+
+  return new braintree.BraintreeGateway({
+    environment: braintree.Environment.Sandbox,
+    merchantId: BRAINTREE_MERCHANT_ID,
+    publicKey: BRAINTREE_PUBLIC_KEY,
+    privateKey: BRAINTREE_PRIVATE_KEY,
+  });
+};
 
 export const createProductController = async (req, res) => {
   try {
@@ -336,50 +350,109 @@ export const productCategoryController=async(req,res)=>{
 //payment gateway api
 export const braintreeTokenController=async(req,res)=>{
     try {
-      gateway.clientToken.generate({},function(err,response){
+      getBraintreeGateway().clientToken.generate({},function(err,response){
         if(err){
-          res.status(500).send(err)
+          return res.status(500).send(err)
         }
         else{
           res.send(response)
         }
       })
     } catch (error) {
-      comnsole.log(error)
+      console.log(error)
+      res.status(500).send({ message: "Payment gateway is not configured" })
     } 
 }
 
 //payment
 export const braintreePaymentsController=async(req,res)=>{
   try {
-    const {cart,nonce}=req.body
-    let total=0;
+    const { cart, nonce } = req.body;
+    if (!Array.isArray(cart) || cart.length === 0 || !nonce) {
+      return res.status(400).send({
+        success: false,
+        message: "Cart and payment nonce are required",
+      });
+    }
 
-    cart.map((i)=>{
-      total+=i.price;
-    });
-    let newTransaction=gateway.transaction.sale({
-      amount:total,
+    const requestedItems = cart.map((item) => ({
+      id: item?._id || item?.id,
+      quantity: Number(item?.quantity ?? 1),
+    }));
+    if (
+      requestedItems.some(
+        (item) =>
+          !item.id ||
+          !mongoose.isValidObjectId(item.id) ||
+          !Number.isInteger(item.quantity) ||
+          item.quantity < 1
+      )
+    ) {
+      return res.status(400).send({
+        success: false,
+        message: "Each cart item must include a valid product ID and quantity",
+      });
+    }
+
+    const productIds = requestedItems.map((item) => item.id);
+    const products = await ProductModel.find({ _id: { $in: productIds } }).select(
+      "_id price quantity"
+    );
+    const productsById = new Map(
+      products.map((product) => [product._id.toString(), product])
+    );
+    let total = 0;
+    for (const item of requestedItems) {
+      const product = productsById.get(item.id.toString());
+      if (!product) {
+        return res.status(400).send({
+          success: false,
+          message: "One or more products are no longer available",
+        });
+      }
+      if (item.quantity > product.quantity) {
+        return res.status(400).send({
+          success: false,
+          message: `Insufficient inventory for ${product._id}`,
+        });
+      }
+      const price = Number(product.price);
+      if (!Number.isFinite(price) || price < 0) {
+        return res.status(500).send({
+          success: false,
+          message: "A product has an invalid price",
+        });
+      }
+      total += price * item.quantity;
+    }
+
+    const gateway = getBraintreeGateway();
+    gateway.transaction.sale({
+      amount: total.toFixed(2),
       paymentMethodNonce:nonce,
       options:{
         submitForSettlement:true
       }
     },
-    function(error,result){
+    async function(error,result){
       if(result){
-        const order=new orderModel({
-          products:cart,
+        await new orderModel({
+          products: requestedItems.map((item) => item.id),
           payment:result,
           buyer:req.user._id
         }).save()
-        res.json({ok:true})
+        return res.json({ok:true})
       }else{
-        res.status(500).send(error)
+        return res.status(500).send(error)
       }
     }
     
     )
   } catch (error) {
     console.log(error)
+    res.status(500).send({
+      success: false,
+      message: "Error while processing payment",
+    })
   }
 }

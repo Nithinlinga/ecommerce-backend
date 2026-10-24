@@ -237,7 +237,24 @@ export const orderStatusController=async(req,res)=>{
   try {
     const {orderId}=req.params;
     const {status}=req.body;
-    const orders=await orderModel.findByIdAndUpdate(orderId,{status},{new:true})
+    const allowedStatuses = ["Not Process", "Processing", "Shipped", "delivered", "Cancel"];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid order status",
+      });
+    }
+    const orders=await orderModel.findByIdAndUpdate(
+      orderId,
+      {status},
+      {new:true, runValidators:true}
+    )
+    if (!orders) {
+      return res.status(404).send({
+        success: false,
+        message: "Order not found",
+      });
+    }
     res.json(orders)
   } catch (error) {
     console.log(error)
